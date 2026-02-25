@@ -1,0 +1,9 @@
+{
+  "telegram_token": "DEIN_TELEGRAM_BOT_TOKEN",
+  "telegram_user_id": "DEINE_TELEGRAM_USER_ID",
+  "garmin_email": "deine@email.com",
+  "garmin_password": "dein_garmin_passwort",
+  "morning_hour": 7,
+  "morning_minute": 0,
+  "timezone": "Europe/Vienna"
+}
