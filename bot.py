@@ -246,25 +246,9 @@ async def cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
-def main():
+async def post_init(app: Application):
+    """Wird aufgerufen sobald der Event-Loop läuft – hier Scheduler starten."""
     global scheduler
-
-    if not TELEGRAM_TOKEN:
-        print("❌ TELEGRAM_TOKEN fehlt! Bitte in config.json oder als Umgebungsvariable setzen.")
-        return
-
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Handler registrieren
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("report", cmd_report))
-    app.add_handler(CommandHandler("today",  cmd_today))
-    app.add_handler(CommandHandler("mfa",    cmd_mfa))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("time",   cmd_time))
-    app.add_handler(CommandHandler("setup",  cmd_setup))
-
-    # Scheduler
     scheduler = AsyncIOScheduler(timezone=TIMEZONE)
     scheduler.add_job(
         send_morning_report,
@@ -275,8 +259,39 @@ def main():
         args=[app]
     )
     scheduler.start()
+    log.info(f"⏰ Scheduler gestartet | Report täglich um {MORNING_HOUR:02d}:{MORNING_MINUTE:02d} {TIMEZONE}")
 
-    log.info(f"🚀 Bot gestartet | Report täglich um {MORNING_HOUR:02d}:{MORNING_MINUTE:02d} {TIMEZONE}")
+
+async def post_shutdown(app: Application):
+    """Scheduler sauber beenden."""
+    if scheduler and scheduler.running:
+        scheduler.shutdown()
+        log.info("Scheduler gestoppt.")
+
+
+def main():
+    if not TELEGRAM_TOKEN:
+        print("❌ TELEGRAM_TOKEN fehlt! Bitte in config.json oder als Umgebungsvariable setzen.")
+        return
+
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    # Handler registrieren
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("today",  cmd_today))
+    app.add_handler(CommandHandler("mfa",    cmd_mfa))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("time",   cmd_time))
+    app.add_handler(CommandHandler("setup",  cmd_setup))
+
+    log.info("🚀 Bot startet...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
