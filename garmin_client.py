@@ -1,26 +1,26 @@
 """
-Garmin Client – Wrapper um garminconnect (>= 0.2.x / garth-basiert)
+Garmin Client – Wrapper um garminconnect 0.2.x (garth-basiert)
 Behandelt Session-Caching und den MFA-Email-Flow via Threading-Bridge.
 
-Neuere garminconnect-Versionen nutzen garth und erwarten einen
-prompt_mfa-Callback. Wir lösen das mit einem threading.Event,
-das vom Telegram-Handler entsperrt wird.
+Aus dem garminconnect Source:
+  self.garth.login(username, password, prompt_mfa=self.prompt_mfa)
+→ prompt_mfa muss auf dem Garmin-Objekt selbst gesetzt werden.
 """
 
 import logging
+import shutil
 import threading
 from pathlib import Path
 from datetime import date
 
 try:
-    import garth
     from garminconnect import Garmin
 except ImportError:
-    raise ImportError("Bitte installieren: pip install garminconnect garth")
+    raise ImportError("Bitte installieren: pip install garminconnect")
 
 log = logging.getLogger(__name__)
 
-SESSION_DIR = Path("garmin_tokens")   # garth speichert OAuth-Tokens als Dateien
+SESSION_DIR = Path("garmin_tokens")
 
 
 class GarminClient:
@@ -30,46 +30,41 @@ class GarminClient:
         self._api: Garmin | None = None
 
         # Threading-Bridge für den MFA-Flow
-        self._mfa_event = threading.Event()
-        self._mfa_code: str | None = None
-        self._login_result: str | None = None   # "ok" | "error: ..."
+        self._mfa_event  = threading.Event()
+        self._mfa_code: str | None  = None
+        self._login_result: str | None = None
         self._login_thread: threading.Thread | None = None
 
     # ── Login ─────────────────────────────────────────────────────────────────
     def login(self) -> str:
         """
-        Versucht Login. Rückgabewerte:
-          "ok"           – sofort eingeloggt (gespeicherte Session)
-          "mfa_required" – Login-Thread wartet auf MFA-Code
+        Rückgabewerte:
+          "ok"           – eingeloggt (Session oder frisch)
+          "mfa_required" – Thread wartet auf Code via submit_mfa()
           "error: ..."   – Fehler
         """
-        # 1) Gespeicherte garth-Session
+        # 1) Gespeicherte Session laden
         if SESSION_DIR.exists():
-            log.info("Versuche gespeicherte Garmin-Session (garth)...")
+            log.info("Versuche gespeicherte Garmin-Session...")
             try:
-                api = Garmin()
+                api = Garmin(self.email, self.password)
                 api.login(tokenstore=str(SESSION_DIR))
                 self._api = api
-                log.info("Gespeicherte Session erfolgreich ✅")
+                log.info("Gespeicherte Session OK ✅")
                 return "ok"
             except Exception as e:
-                log.warning(f"Session abgelaufen oder ungültig: {e}")
-                # Token-Ordner löschen damit frischer Login erfolgt
-                import shutil
+                log.warning(f"Session ungültig ({e}) – lösche und logge neu ein.")
                 shutil.rmtree(SESSION_DIR, ignore_errors=True)
 
-        # 2) Frischer Login in separatem Thread
-        #    (garminconnect.login() ist synchron-blockierend)
+        # 2) Frischer Login in Thread (blockierend wegen MFA)
         self._mfa_event.clear()
-        self._mfa_code = None
+        self._mfa_code   = None
         self._login_result = None
 
-        self._login_thread = threading.Thread(
-            target=self._login_worker, daemon=True
-        )
+        self._login_thread = threading.Thread(target=self._login_worker, daemon=True)
         self._login_thread.start()
 
-        # Kurz warten: endet der Thread sofort ohne MFA → direkt fertig
+        # 8 Sekunden warten – wenn fertig ohne MFA direkt zurück
         self._login_thread.join(timeout=8)
 
         if self._login_result == "ok":
@@ -77,19 +72,22 @@ class GarminClient:
         elif self._login_result and self._login_result.startswith("error"):
             return self._login_result
         else:
-            # Thread wartet noch → MFA benötigt
+            # Thread wartet noch auf MFA-Code
             return "mfa_required"
 
     def _login_worker(self):
-        """Läuft im Hintergrund-Thread; wartet ggf. auf MFA-Code."""
+        """Läuft im Hintergrund-Thread."""
         try:
             api = Garmin(self.email, self.password)
-            # Direkt das Attribut auf dem internen garth-Client setzen
-            # (funktioniert mit garth 0.4.x bis 0.5.x)
-            api.garth.prompt_mfa = self._mfa_callback
+            # Laut garminconnect-Source wird self.prompt_mfa direkt
+            # an garth.login() weitergegeben – hier setzen:
+            api.prompt_mfa = self._mfa_callback
             api.login()
+
+            # Tokens für nächsten Start speichern
             SESSION_DIR.mkdir(parents=True, exist_ok=True)
             api.garth.dump(str(SESSION_DIR))
+
             self._api = api
             self._login_result = "ok"
             log.info("Garmin Login erfolgreich ✅")
@@ -98,27 +96,20 @@ class GarminClient:
             log.error(f"Garmin Login fehlgeschlagen: {e}")
 
     def _mfa_callback(self) -> str:
-        """
-        Wird von garminconnect aufgerufen wenn MFA nötig ist.
-        Blockiert den Login-Thread bis submit_mfa() den Code liefert.
-        """
-        log.info("MFA-Callback aufgerufen – warte auf Code via Telegram...")
-        self._mfa_event.wait(timeout=300)   # max 5 Minuten warten
+        """Wird von garth aufgerufen – blockiert bis submit_mfa() den Code liefert."""
+        log.info("MFA-Callback: warte auf Telegram-Code (max 5 Min.)...")
+        self._mfa_event.wait(timeout=300)
         code = self._mfa_code or ""
-        log.info(f"MFA-Code empfangen: {code}")
+        log.info(f"MFA-Code erhalten: {code}")
         return code
 
     def submit_mfa(self, code: str) -> str:
-        """
-        Übergibt den MFA-Code an den wartenden Login-Thread
-        und wartet auf dessen Ergebnis.
-        """
+        """Telegram-Handler übergibt hier den Code."""
         self._mfa_code = code
-        self._mfa_event.set()   # Login-Thread entsperren
+        self._mfa_event.set()
 
-        # Auf Ergebnis warten (max 15 Sek.)
         if self._login_thread:
-            self._login_thread.join(timeout=15)
+            self._login_thread.join(timeout=20)
 
         return self._login_result or "error: Timeout beim Login"
 
@@ -127,7 +118,6 @@ class GarminClient:
 
     # ── Daten abrufen ─────────────────────────────────────────────────────────
     def fetch_all(self, target_date: date) -> dict:
-        """Ruft alle relevanten Daten für ein Datum ab."""
         if not self._api:
             raise RuntimeError("Nicht eingeloggt!")
 
