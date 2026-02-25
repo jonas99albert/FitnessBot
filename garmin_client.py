@@ -1,26 +1,26 @@
 """
-Garmin Client – Wrapper um garminconnect
-Behandelt Session-Caching und den MFA-Email-Flow.
+Garmin Client – Wrapper um garminconnect (>= 0.2.x / garth-basiert)
+Behandelt Session-Caching und den MFA-Email-Flow via Threading-Bridge.
+
+Neuere garminconnect-Versionen nutzen garth und erwarten einen
+prompt_mfa-Callback. Wir lösen das mit einem threading.Event,
+das vom Telegram-Handler entsperrt wird.
 """
 
-import json
 import logging
-import pickle
+import threading
 from pathlib import Path
 from datetime import date
 
 try:
-    from garminconnect import (
-        Garmin,
-        GarminConnectAuthenticationError,
-        GarminConnectTooManyRequestsError,
-    )
+    import garth
+    from garminconnect import Garmin
 except ImportError:
-    raise ImportError("Bitte installieren: pip install garminconnect")
+    raise ImportError("Bitte installieren: pip install garminconnect garth")
 
 log = logging.getLogger(__name__)
 
-SESSION_FILE = Path("garmin_session.pkl")
+SESSION_DIR = Path("garmin_tokens")   # garth speichert OAuth-Tokens als Dateien
 
 
 class GarminClient:
@@ -29,78 +29,98 @@ class GarminClient:
         self.password = password
         self._api: Garmin | None = None
 
+        # Threading-Bridge für den MFA-Flow
+        self._mfa_event = threading.Event()
+        self._mfa_code: str | None = None
+        self._login_result: str | None = None   # "ok" | "error: ..."
+        self._login_thread: threading.Thread | None = None
+
     # ── Login ─────────────────────────────────────────────────────────────────
     def login(self) -> str:
         """
-        Versucht Login. Gibt zurück:
-          "ok"           – erfolgreich
-          "mfa_required" – Garmin hat Code per E-Mail geschickt
+        Versucht Login. Rückgabewerte:
+          "ok"           – sofort eingeloggt (gespeicherte Session)
+          "mfa_required" – Login-Thread wartet auf MFA-Code
           "error: ..."   – Fehler
         """
-        # 1) Gespeicherte Session versuchen
-        if SESSION_FILE.exists():
-            log.info("Versuche gespeicherte Garmin-Session...")
+        # 1) Gespeicherte garth-Session
+        if SESSION_DIR.exists():
+            log.info("Versuche gespeicherte Garmin-Session (garth)...")
             try:
-                with open(SESSION_FILE, "rb") as f:
-                    api = pickle.load(f)
-                api.login()
+                api = Garmin()
+                api.login(tokenstore=str(SESSION_DIR))
                 self._api = api
                 log.info("Gespeicherte Session erfolgreich ✅")
                 return "ok"
             except Exception as e:
-                log.warning(f"Session ungültig, neu einloggen: {e}")
-                SESSION_FILE.unlink(missing_ok=True)
+                log.warning(f"Session abgelaufen oder ungültig: {e}")
+                # Token-Ordner löschen damit frischer Login erfolgt
+                import shutil
+                shutil.rmtree(SESSION_DIR, ignore_errors=True)
 
-        # 2) Frischer Login
+        # 2) Frischer Login in separatem Thread
+        #    (garminconnect.login() ist synchron-blockierend)
+        self._mfa_event.clear()
+        self._mfa_code = None
+        self._login_result = None
+
+        self._login_thread = threading.Thread(
+            target=self._login_worker, daemon=True
+        )
+        self._login_thread.start()
+
+        # Kurz warten: endet der Thread sofort ohne MFA → direkt fertig
+        self._login_thread.join(timeout=8)
+
+        if self._login_result == "ok":
+            return "ok"
+        elif self._login_result and self._login_result.startswith("error"):
+            return self._login_result
+        else:
+            # Thread wartet noch → MFA benötigt
+            return "mfa_required"
+
+    def _login_worker(self):
+        """Läuft im Hintergrund-Thread; wartet ggf. auf MFA-Code."""
         try:
             api = Garmin(self.email, self.password)
-            api.login()
+            api.login(prompt_mfa=self._mfa_callback)
+            SESSION_DIR.mkdir(parents=True, exist_ok=True)
+            api.garth.dump(str(SESSION_DIR))
             self._api = api
-            self._save_session()
-            return "ok"
-
-        except GarminConnectAuthenticationError as e:
-            msg = str(e)
-            # Garmin verlangt MFA-Code (Email-OTP)
-            if "MFA" in msg or "needs_mfa" in msg.lower() or "NEEDS_MFA" in msg:
-                log.info("MFA erforderlich")
-                # api-Objekt für späteren MFA-Submit zwischenspeichern
-                self._api = api
-                return "mfa_required"
-            return f"error: {msg}"
-
-        except GarminConnectTooManyRequestsError:
-            return "error: Zu viele Anfragen – bitte kurz warten."
-
+            self._login_result = "ok"
+            log.info("Garmin Login erfolgreich ✅")
         except Exception as e:
-            # Garminconnect wirft manchmal Exception mit 'needs_mfa' im Text
-            msg = str(e)
-            if "mfa" in msg.lower() or "needs_mfa" in msg.lower():
-                self._api = Garmin(self.email, self.password)
-                return "mfa_required"
-            return f"error: {msg}"
+            self._login_result = f"error: {e}"
+            log.error(f"Garmin Login fehlgeschlagen: {e}")
+
+    def _mfa_callback(self) -> str:
+        """
+        Wird von garminconnect aufgerufen wenn MFA nötig ist.
+        Blockiert den Login-Thread bis submit_mfa() den Code liefert.
+        """
+        log.info("MFA-Callback aufgerufen – warte auf Code via Telegram...")
+        self._mfa_event.wait(timeout=300)   # max 5 Minuten warten
+        code = self._mfa_code or ""
+        log.info(f"MFA-Code empfangen: {code}")
+        return code
 
     def submit_mfa(self, code: str) -> str:
-        """Sendet den MFA-Code an Garmin."""
-        if not self._api:
-            return "error: Kein Login-Objekt vorhanden"
-        try:
-            self._api.login(code)
-            self._save_session()
-            return "ok"
-        except Exception as e:
-            return f"error: {e}"
+        """
+        Übergibt den MFA-Code an den wartenden Login-Thread
+        und wartet auf dessen Ergebnis.
+        """
+        self._mfa_code = code
+        self._mfa_event.set()   # Login-Thread entsperren
+
+        # Auf Ergebnis warten (max 15 Sek.)
+        if self._login_thread:
+            self._login_thread.join(timeout=15)
+
+        return self._login_result or "error: Timeout beim Login"
 
     def is_logged_in(self) -> bool:
         return self._api is not None
-
-    def _save_session(self):
-        try:
-            with open(SESSION_FILE, "wb") as f:
-                pickle.dump(self._api, f)
-            log.info("Session gespeichert 💾")
-        except Exception as e:
-            log.warning(f"Session konnte nicht gespeichert werden: {e}")
 
     # ── Daten abrufen ─────────────────────────────────────────────────────────
     def fetch_all(self, target_date: date) -> dict:
@@ -118,15 +138,15 @@ class GarminClient:
                 log.warning(f"Konnte {key} nicht abrufen: {e}")
                 data[key] = None
 
-        safe("steps",          self._api.get_steps_data,           d)
-        safe("sleep",          self._api.get_sleep_data,           d)
-        safe("hrv",            self._api.get_hrv_data,             d)
-        safe("heart_rate",     self._api.get_heart_rates,          d)
-        safe("stress",         self._api.get_stress_data,          d)
-        safe("body_battery",   self._api.get_body_battery,         d)
-        safe("activities",     self._api.get_activities_by_date,   d, d)
-        safe("stats",          self._api.get_stats,                d)
-        safe("respiration",    self._api.get_respiration_data,     d)
-        safe("spo2",           self._api.get_spo2_data,            d)
+        safe("steps",        self._api.get_steps_data,         d)
+        safe("sleep",        self._api.get_sleep_data,         d)
+        safe("hrv",          self._api.get_hrv_data,           d)
+        safe("heart_rate",   self._api.get_heart_rates,        d)
+        safe("stress",       self._api.get_stress_data,        d)
+        safe("body_battery", self._api.get_body_battery,       d)
+        safe("activities",   self._api.get_activities_by_date, d, d)
+        safe("stats",        self._api.get_stats,              d)
+        safe("respiration",  self._api.get_respiration_data,   d)
+        safe("spo2",         self._api.get_spo2_data,          d)
 
         return data
