@@ -83,9 +83,10 @@ class GarminClient:
     def _login_worker(self):
         """Läuft im Hintergrund-Thread; wartet ggf. auf MFA-Code."""
         try:
-            # garth 0.4+ erwartet den MFA-Callback über garth.configure()
-            garth.configure(prompt_mfa=self._mfa_callback)
             api = Garmin(self.email, self.password)
+            # Direkt das Attribut auf dem internen garth-Client setzen
+            # (funktioniert mit garth 0.4.x bis 0.5.x)
+            api.garth.prompt_mfa = self._mfa_callback
             api.login()
             SESSION_DIR.mkdir(parents=True, exist_ok=True)
             api.garth.dump(str(SESSION_DIR))
