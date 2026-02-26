@@ -42,13 +42,19 @@ def save_config(cfg: dict):
 
 cfg = load_config()
 
-TELEGRAM_TOKEN   = cfg.get("telegram_token")   or os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_USER_ID = cfg.get("telegram_user_id") or os.getenv("TELEGRAM_USER_ID", "")
-GARMIN_EMAIL     = cfg.get("garmin_email")     or os.getenv("GARMIN_EMAIL", "")
-GARMIN_PASSWORD  = cfg.get("garmin_password")  or os.getenv("GARMIN_PASSWORD", "")
-MORNING_HOUR     = int(cfg.get("morning_hour", 7))
-MORNING_MINUTE   = int(cfg.get("morning_minute", 0))
-TIMEZONE         = cfg.get("timezone", "Europe/Vienna")
+TELEGRAM_TOKEN    = cfg.get("telegram_token")    or os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_USER_ID  = cfg.get("telegram_user_id")  or os.getenv("TELEGRAM_USER_ID", "")
+GARMIN_EMAIL      = cfg.get("garmin_email")      or os.getenv("GARMIN_EMAIL", "")
+GARMIN_PASSWORD   = cfg.get("garmin_password")   or os.getenv("GARMIN_PASSWORD", "")
+ANTHROPIC_API_KEY = cfg.get("anthropic_api_key") or os.getenv("ANTHROPIC_API_KEY", "")
+MORNING_HOUR      = int(cfg.get("morning_hour", 7))
+MORNING_MINUTE    = int(cfg.get("morning_minute", 0))
+TIMEZONE          = cfg.get("timezone", "Europe/Vienna")
+
+# Anthropic Key als Umgebungsvariable setzen (wird von analyzer.py gelesen)
+if ANTHROPIC_API_KEY:
+    os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
+
 
 # Global state für MFA-Flow
 mfa_pending: dict = {}   # user_id -> GarminClient waiting for code
